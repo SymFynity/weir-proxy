@@ -1,0 +1,178 @@
+# Weir
+
+Weir is an inline circuit breaker for AI API traffic. It sits between your
+application (or an agentic tool like an IDE assistant) and OpenAI or
+Anthropic, tracks a rolling token budget per tenant, and cuts off a request
+the moment it would exceed that budget — before the over-budget content
+ever reaches the client.
+
+It exists to stop the **Runaway Agentic Loop**: a recursive agent or
+tool-calling loop that goes wrong and silently runs up an unbounded API
+bill before anyone notices. Traditional billing dashboards report hourly
+or daily, long after the damage is done. Weir enforces in real time, on
+every request and every streamed chunk.
+
+Weir is a standalone open-source project — the proxy itself, nothing more.
+It has no dependency on, and makes no reference to, any hosted or
+commercial offering.
+
+## How it works
+
+- Configure a token budget per tenant (an API key, an application, a team
+  — whatever `x-weir-tenant` identifies) in a TOML file.
+- Point your client at Weir instead of the provider directly. Weir
+  forwards the request upstream unmodified — your real API key still goes
+  to the real provider; Weir never stores or reissues credentials.
+- For streaming responses, Weir estimates each chunk's cost with a real
+  tokenizer, reconciles against the provider's own usage data as it
+  arrives, and checks the budget *before* forwarding each chunk. An
+  over-budget chunk is never sent to the client — Weir emits a terminal
+  error event and closes the connection instead.
+- For non-streaming responses, Weir buffers the complete response, reads
+  its authoritative usage, and only forwards it if that keeps the tenant
+  within budget — otherwise the client gets a `429` instead of the
+  response.
+- A tenant already over budget is rejected at admission, before Weir even
+  calls upstream.
+- The config file hot-reloads on change — no restart needed to adjust a
+  budget.
+
+See [`docs/superpowers/specs/2026-07-10-weir-circuit-breaker-design.md`](docs/superpowers/specs/2026-07-10-weir-circuit-breaker-design.md)
+for the full design.
+
+## Quick start
+
+### Build from source
+
+Requires a recent stable Rust toolchain.
+
+```bash
+cargo build --release
+cp weir.example.toml weir.toml
+# edit weir.toml with your own tenant IDs and budgets
+./target/release/weir
+```
+
+Weir listens on `0.0.0.0:8080` and reads `weir.toml` from the current
+directory by default.
+
+### Run with Docker
+
+```bash
+docker build -t weir:local .
+docker run --rm -p 8080:8080 \
+  -v "$(pwd)/weir.example.toml:/weir.toml:ro" \
+  weir:local
+```
+
+The image was verified to build for both `linux/amd64` and `linux/arm64`
+via `docker buildx build --platform linux/amd64,linux/arm64 -t weir:local .`
+
+## Configuration
+
+`weir.toml` maps tenant IDs to a token ceiling and a rolling window:
+
+```toml
+[tenants.acct_123]
+max_tokens = 50000
+window_seconds = 60
+
+[tenants.acct_456]
+max_tokens = 200000
+window_seconds = 3600
+```
+
+A request from a tenant not listed here is rejected with `401`.
+
+Environment variables:
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `WEIR_CONFIG` | `weir.toml` | Path to the config file |
+| `WEIR_OPENAI_BASE` | `https://api.openai.com` | Upstream OpenAI base URL |
+| `WEIR_ANTHROPIC_BASE` | `https://api.anthropic.com` | Upstream Anthropic base URL |
+
+## Using it
+
+Weir exposes two route prefixes that mirror the upstream provider's own
+paths — `/openai/*` forwards to OpenAI, `/anthropic/*` forwards to
+Anthropic. Every request must carry an `x-weir-tenant` header identifying
+which configured tenant it belongs to; everything else (your real API
+key, model, body) passes through unchanged.
+
+### curl
+
+```bash
+curl http://localhost:8080/openai/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer $OPENAI_API_KEY" \
+  -H "x-weir-tenant: acct_123" \
+  -d '{
+    "model": "gpt-4o-mini",
+    "stream": true,
+    "messages": [{"role": "user", "content": "Say hi in five words."}]
+  }'
+```
+
+```bash
+curl http://localhost:8080/anthropic/v1/messages \
+  -H "Content-Type: application/json" \
+  -H "x-api-key: $ANTHROPIC_API_KEY" \
+  -H "anthropic-version: 2023-06-01" \
+  -H "x-weir-tenant: acct_123" \
+  -d '{
+    "model": "claude-sonnet-5",
+    "max_tokens": 256,
+    "stream": true,
+    "messages": [{"role": "user", "content": "Say hi in five words."}]
+  }'
+```
+
+### OpenAI SDK
+
+Most OpenAI-compatible SDKs let you set both a base URL and default
+headers on the client, which is all Weir needs:
+
+```python
+from openai import OpenAI
+
+client = OpenAI(
+    base_url="http://localhost:8080/openai/v1",
+    api_key="sk-...",  # your real OpenAI key — Weir passes it through
+    default_headers={"x-weir-tenant": "acct_123"},
+)
+```
+
+### Claude Code
+
+Claude Code reads `ANTHROPIC_BASE_URL`, `ANTHROPIC_AUTH_TOKEN`, and
+`ANTHROPIC_CUSTOM_HEADERS` from its settings file (`~/.claude/settings.json`,
+or a project-level `.claude/settings.json`):
+
+```json
+{
+  "env": {
+    "ANTHROPIC_BASE_URL": "http://localhost:8080/anthropic",
+    "ANTHROPIC_AUTH_TOKEN": "sk-ant-...",
+    "ANTHROPIC_CUSTOM_HEADERS": "x-weir-tenant: acct_123"
+  }
+}
+```
+
+With this in place, every request Claude Code makes is routed through
+Weir and counted against the `acct_123` budget in `weir.toml` — including
+the tool-calling loops that are exactly what Weir is designed to catch.
+
+## Development
+
+```bash
+cargo test          # full test suite
+cargo build --release
+```
+
+The implementation plan and design spec under `docs/superpowers/` describe
+the full task-by-task build and the review history.
+
+## License
+
+Apache License 2.0 — see [`LICENSE`](LICENSE).
