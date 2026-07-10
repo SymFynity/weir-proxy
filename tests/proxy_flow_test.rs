@@ -105,5 +105,6 @@ data: {\"choices\":[{\"delta\":{\"content\":\"should never be forwarded\"}}]}\n\
     let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
     let body = String::from_utf8_lossy(&body);
     assert!(body.contains("budget_exceeded"));
+    assert!(!body.contains("This is more than one token"));
     assert!(!body.contains("should never be forwarded"));
 }
