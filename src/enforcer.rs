@@ -167,6 +167,10 @@ mod tests {
         fn chunk_cost(&mut self, _raw: &Bytes) -> ChunkCost {
             ChunkCost { estimated_tokens: self.cost_per_chunk, authoritative_total: None }
         }
+
+        fn non_streaming_cost(&self, _body: &Bytes) -> Option<u64> {
+            None
+        }
     }
 
     struct AuthoritativeCostAdapter {
@@ -177,6 +181,10 @@ mod tests {
         fn chunk_cost(&mut self, _raw: &Bytes) -> ChunkCost {
             let total = self.totals.pop_front().unwrap_or(0);
             ChunkCost { estimated_tokens: 0, authoritative_total: Some(total) }
+        }
+
+        fn non_streaming_cost(&self, _body: &Bytes) -> Option<u64> {
+            None
         }
     }
 

@@ -85,6 +85,15 @@ impl ProviderAdapter for OpenAiAdapter {
 
         ChunkCost { estimated_tokens, authoritative_total }
     }
+
+    fn non_streaming_cost(&self, body: &Bytes) -> Option<u64> {
+        #[derive(Deserialize)]
+        struct NonStreamingResponse {
+            usage: Option<OpenAiUsage>,
+        }
+        let parsed: NonStreamingResponse = serde_json::from_slice(body).ok()?;
+        parsed.usage.map(|u| u.total_tokens)
+    }
 }
 
 #[cfg(test)]
@@ -172,5 +181,21 @@ mod tests {
         );
         let cost = adapter.chunk_cost(&raw);
         assert!(cost.estimated_tokens >= 1);
+    }
+
+    #[test]
+    fn non_streaming_cost_extracts_total_tokens() {
+        let adapter = OpenAiAdapter::new(tokenizer());
+        let body = Bytes::from_static(
+            b"{\"choices\":[{\"message\":{\"content\":\"Hi\"}}],\"usage\":{\"prompt_tokens\":5,\"completion_tokens\":2,\"total_tokens\":7}}",
+        );
+        assert_eq!(adapter.non_streaming_cost(&body), Some(7));
+    }
+
+    #[test]
+    fn non_streaming_cost_returns_none_for_unparseable_body() {
+        let adapter = OpenAiAdapter::new(tokenizer());
+        let body = Bytes::from_static(b"not json at all");
+        assert_eq!(adapter.non_streaming_cost(&body), None);
     }
 }

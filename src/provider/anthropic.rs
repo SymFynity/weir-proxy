@@ -88,6 +88,20 @@ impl ProviderAdapter for AnthropicAdapter {
 
         ChunkCost { estimated_tokens, authoritative_total }
     }
+
+    fn non_streaming_cost(&self, body: &Bytes) -> Option<u64> {
+        #[derive(Deserialize)]
+        struct NonStreamingUsage {
+            input_tokens: u64,
+            output_tokens: u64,
+        }
+        #[derive(Deserialize)]
+        struct NonStreamingResponse {
+            usage: NonStreamingUsage,
+        }
+        let parsed: NonStreamingResponse = serde_json::from_slice(body).ok()?;
+        Some(parsed.usage.input_tokens + parsed.usage.output_tokens)
+    }
 }
 
 #[cfg(test)]
@@ -147,5 +161,21 @@ mod tests {
             cost.estimated_tokens
         );
         assert_eq!(cost.authoritative_total, None);
+    }
+
+    #[test]
+    fn non_streaming_cost_combines_input_and_output_tokens() {
+        let adapter = AnthropicAdapter::new(tokenizer());
+        let body = Bytes::from_static(
+            b"{\"content\":[{\"type\":\"text\",\"text\":\"Hi\"}],\"usage\":{\"input_tokens\":25,\"output_tokens\":15}}",
+        );
+        assert_eq!(adapter.non_streaming_cost(&body), Some(40));
+    }
+
+    #[test]
+    fn non_streaming_cost_returns_none_for_unparseable_body() {
+        let adapter = AnthropicAdapter::new(tokenizer());
+        let body = Bytes::from_static(b"not json at all");
+        assert_eq!(adapter.non_streaming_cost(&body), None);
     }
 }

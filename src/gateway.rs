@@ -124,14 +124,61 @@ async fn proxy(
 
     let status = upstream_res.status();
     let upstream_headers = upstream_res.headers().clone();
+    let is_streaming = upstream_headers
+        .get(axum::http::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .map(|ct| ct.starts_with("text/event-stream"))
+        .unwrap_or(false);
+
+    if is_streaming {
+        let adapter = state.tokenizer.new_adapter(provider);
+        let stream = enforcer::enforce(
+            tenant,
+            upstream_res.bytes_stream(),
+            adapter,
+            state.budget.clone(),
+            now_ms,
+        );
+
+        let mut response_builder = Response::builder().status(status);
+        for (name, value) in upstream_headers.iter() {
+            if !is_hop_by_hop(name) {
+                response_builder = response_builder.header(name, value);
+            }
+        }
+        if !upstream_headers.contains_key(axum::http::header::CONTENT_TYPE) {
+            response_builder = response_builder.header("content-type", "text/event-stream");
+        }
+
+        let mut response = response_builder.body(Body::from_stream(stream)).unwrap();
+        response.headers_mut().insert(
+            HeaderName::from_static("connection"),
+            HeaderValue::from_static("close"),
+        );
+        return response;
+    }
+
+    // Non-streaming: the whole response is one atomic unit, and it always
+    // carries its own authoritative usage — no bytes have reached the
+    // client yet, so we buffer the full body, record its usage, and only
+    // forward it if that keeps the tenant within budget. A response whose
+    // usage alone exceeds the ceiling is rejected outright (a real 429,
+    // not a mid-stream trip) rather than delivered to the client.
+    let body_bytes = match upstream_res.bytes().await {
+        Ok(b) => b,
+        Err(e) => return with_connection_close(WeirError::Upstream(e).into_response()),
+    };
+
     let adapter = state.tokenizer.new_adapter(provider);
-    let stream = enforcer::enforce(
-        tenant,
-        upstream_res.bytes_stream(),
-        adapter,
-        state.budget.clone(),
-        now_ms,
-    );
+    if let Some(total) = adapter.non_streaming_cost(&body_bytes) {
+        match state.budget.record(&tenant, total, now_ms()) {
+            Ok(true) => {}
+            Ok(false) => {
+                return with_connection_close(WeirError::BudgetExceeded(tenant).into_response())
+            }
+            Err(e) => return with_connection_close(e.into_response()),
+        }
+    }
 
     let mut response_builder = Response::builder().status(status);
     for (name, value) in upstream_headers.iter() {
@@ -139,11 +186,7 @@ async fn proxy(
             response_builder = response_builder.header(name, value);
         }
     }
-    if !upstream_headers.contains_key(axum::http::header::CONTENT_TYPE) {
-        response_builder = response_builder.header("content-type", "text/event-stream");
-    }
-
-    let mut response = response_builder.body(Body::from_stream(stream)).unwrap();
+    let mut response = response_builder.body(Body::from(body_bytes)).unwrap();
     response.headers_mut().insert(
         HeaderName::from_static("connection"),
         HeaderValue::from_static("close"),
@@ -338,6 +381,97 @@ mod tests {
             response.status(),
             StatusCode::PAYLOAD_TOO_LARGE,
             "a request body larger than Weir's 100MiB cap must be rejected with 413"
+        );
+    }
+
+    #[tokio::test]
+    async fn non_streaming_response_usage_is_recorded_against_budget() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_raw(
+                    "{\"choices\":[{\"message\":{\"content\":\"Hi\"}}],\"usage\":{\"prompt_tokens\":5,\"completion_tokens\":2,\"total_tokens\":7}}",
+                    "application/json",
+                ),
+            )
+            .mount(&mock)
+            .await;
+
+        // Budget of exactly 7 tokens: the first non-streaming response
+        // lands exactly at the ceiling (allowed, matching BudgetRegistry's
+        // record() <= semantics), and a second request should then be
+        // rejected at admission.
+        let mut state = state_with_tenant("acct_1", 7);
+        state.openai_base = mock.uri();
+        let app = router(state);
+
+        let make_request = || {
+            Request::builder()
+                .uri("/openai/v1/chat/completions")
+                .method("POST")
+                .header(TENANT_HEADER, "acct_1")
+                .body(AxumBody::empty())
+                .unwrap()
+        };
+
+        let first = app.clone().oneshot(make_request()).await.unwrap();
+        assert_eq!(
+            first.status(),
+            StatusCode::OK,
+            "first non-streaming response should be forwarded and its usage recorded"
+        );
+        let body = axum::body::to_bytes(first.into_body(), usize::MAX).await.unwrap();
+        assert!(String::from_utf8_lossy(&body).contains("Hi"));
+
+        let second = app.oneshot(make_request()).await.unwrap();
+        assert_eq!(
+            second.status(),
+            StatusCode::TOO_MANY_REQUESTS,
+            "the 7-token usage from the first non-streaming response must have been recorded, tripping admission for the second request"
+        );
+    }
+
+    #[tokio::test]
+    async fn non_streaming_response_over_budget_is_rejected() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_raw(
+                    "{\"choices\":[{\"message\":{\"content\":\"Hi\"}}],\"usage\":{\"prompt_tokens\":50,\"completion_tokens\":50,\"total_tokens\":100}}",
+                    "application/json",
+                ),
+            )
+            .mount(&mock)
+            .await;
+
+        let mut state = state_with_tenant("acct_1", 10); // ceiling far below the 100-token response
+        state.openai_base = mock.uri();
+        let app = router(state);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/openai/v1/chat/completions")
+                    .method("POST")
+                    .header(TENANT_HEADER, "acct_1")
+                    .body(AxumBody::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            response.status(),
+            StatusCode::TOO_MANY_REQUESTS,
+            "a non-streaming response whose usage alone exceeds the ceiling must be rejected, not forwarded to the client"
         );
     }
 }

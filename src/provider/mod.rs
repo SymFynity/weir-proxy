@@ -15,6 +15,15 @@ pub struct ChunkCost {
 
 pub trait ProviderAdapter: Send {
     fn chunk_cost(&mut self, raw: &Bytes) -> ChunkCost;
+
+    /// Parses a complete (non-streaming) JSON response body and returns the
+    /// authoritative total token count, if the body's shape is recognized.
+    /// Non-streaming responses always carry their own authoritative usage
+    /// (no interim estimation needed, unlike the streaming `chunk_cost`
+    /// path). Returns `None` for a body that doesn't parse as an expected
+    /// response shape (e.g. a provider error response) — no usage means
+    /// nothing to charge.
+    fn non_streaming_cost(&self, body: &Bytes) -> Option<u64>;
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
