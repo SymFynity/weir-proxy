@@ -82,6 +82,17 @@ mod tests {
         }
     }
 
+    struct AuthoritativeCostAdapter {
+        totals: std::collections::VecDeque<u64>,
+    }
+
+    impl ProviderAdapter for AuthoritativeCostAdapter {
+        fn chunk_cost(&mut self, _raw: &Bytes) -> ChunkCost {
+            let total = self.totals.pop_front().unwrap_or(0);
+            ChunkCost { estimated_tokens: 0, authoritative_total: Some(total) }
+        }
+    }
+
     fn budget_with(tenant: &str, max_tokens: u64) -> Arc<BudgetRegistry> {
         let mut limits: TenantLimits = HashMap::new();
         limits.insert(
@@ -126,5 +137,36 @@ mod tests {
         assert_eq!(out[0].as_ref().unwrap(), &Bytes::from_static(b"chunk1"));
         let trip_event = out[1].as_ref().unwrap();
         assert!(String::from_utf8_lossy(trip_event).contains("budget_exceeded"));
+    }
+
+    #[tokio::test]
+    async fn authoritative_total_reconciles_via_delta_not_double_count() {
+        let upstream = futures::stream::iter(vec![
+            Ok(Bytes::from_static(b"chunk1")),
+            Ok(Bytes::from_static(b"chunk2")),
+            Ok(Bytes::from_static(b"chunk3")),
+        ]);
+        let adapter: Box<dyn ProviderAdapter> = Box::new(AuthoritativeCostAdapter {
+            totals: std::collections::VecDeque::from(vec![30, 70, 70]),
+        });
+        let budget = budget_with("acct_1", 100);
+
+        let out: Vec<_> = enforce("acct_1".into(), upstream, adapter, budget, || 0)
+            .collect()
+            .await;
+
+        // Chunk1 reports total=30 (delta 30, recorded=30). Chunk2 reports
+        // total=70 (delta 40, recorded=70). Chunk3 reports the SAME total=70
+        // again (delta 0, recorded stays 70). All three should forward
+        // normally, staying under the 100 ceiling throughout.
+        //
+        // If the reconciliation regressed to recording the full `total` each
+        // time instead of the delta versus what was already recorded, the
+        // registry would see 30 + 70 + 70 = 170 — over the 100 ceiling — and
+        // chunk3 would incorrectly trip instead of being forwarded. This test
+        // exists specifically to catch that regression.
+        assert_eq!(out.len(), 3);
+        assert!(out.iter().all(|r| r.is_ok()));
+        assert_eq!(out[2].as_ref().unwrap(), &Bytes::from_static(b"chunk3"));
     }
 }
