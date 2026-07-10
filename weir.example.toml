@@ -1,0 +1,7 @@
+[tenants.acct_123]
+max_tokens = 50000
+window_seconds = 60
+
+[tenants.acct_456]
+max_tokens = 200000
+window_seconds = 3600
