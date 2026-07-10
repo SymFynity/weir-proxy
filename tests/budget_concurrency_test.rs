@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -18,12 +19,16 @@ async fn concurrent_streams_never_exceed_ceiling_by_more_than_one_chunk() {
     ))));
 
     let chunk_cost = 50u64;
+    let successful_calls = Arc::new(AtomicUsize::new(0));
     let mut handles = Vec::new();
     for _ in 0..40 {
         let registry = registry.clone();
+        let successful_calls = successful_calls.clone();
         handles.push(tokio::spawn(async move {
             for _ in 0..10 {
-                let _ = registry.record("acct_1", chunk_cost, 0);
+                if registry.record("acct_1", chunk_cost, 0).unwrap() {
+                    successful_calls.fetch_add(1, Ordering::Relaxed);
+                }
             }
         }));
     }
@@ -31,9 +36,23 @@ async fn concurrent_streams_never_exceed_ceiling_by_more_than_one_chunk() {
         h.await.unwrap();
     }
 
-    let total = registry.is_within_budget("acct_1", 0);
-    // We can't assert an exact total (workers race past the ceiling by
-    // design under lock-free accounting), but it must not run away
-    // unbounded: total recorded is bounded by (attempts * chunk_cost).
-    assert!(total.is_ok());
+    // Each successful call recorded exactly `chunk_cost` tokens, so total
+    // recorded usage is `successful_calls * chunk_cost`. Under lock-free
+    // accounting, concurrent racing callers can push the total up to one
+    // chunk past the ceiling before the registry starts rejecting further
+    // calls (the accepted, documented trade-off — see BudgetRegistry::
+    // record's doc comment) — but it must never run away unbounded. The
+    // expected count is ceiling / chunk_cost = 200; allow one extra chunk
+    // (201) for that bounded overshoot.
+    let expected = ceiling / chunk_cost;
+    let count = successful_calls.load(Ordering::Relaxed) as u64;
+    assert!(
+        count <= expected + 1,
+        "expected at most {} successful calls (one chunk of overshoot allowed), got {count}",
+        expected + 1
+    );
+    assert!(
+        count < 400,
+        "all 400 concurrent calls succeeded — the ceiling was never enforced"
+    );
 }
