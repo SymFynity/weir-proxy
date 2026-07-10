@@ -101,4 +101,26 @@ mod tests {
         assert_eq!(cost.estimated_tokens, 0);
         assert_eq!(cost.authoritative_total, None);
     }
+
+    #[test]
+    fn skips_malformed_json_lines_without_panicking() {
+        let mut adapter = OpenAiAdapter::new(tokenizer());
+        let raw = Bytes::from_static(b"data: {not valid json\n\n");
+        let cost = adapter.chunk_cost(&raw);
+        assert_eq!(cost.estimated_tokens, 0);
+        assert_eq!(cost.authoritative_total, None);
+    }
+
+    #[test]
+    fn handles_non_utf8_bytes_without_panicking() {
+        let mut adapter = OpenAiAdapter::new(tokenizer());
+        let mut raw = b"data: {\"choices\":[{\"delta\":{\"content\":\"".to_vec();
+        raw.extend_from_slice(&[0xFF, 0xFE]); // invalid UTF-8
+        raw.extend_from_slice(b"\"}}]}\n\n");
+        let cost = adapter.chunk_cost(&Bytes::from(raw));
+        // Must not panic; invalid UTF-8 is lossily replaced, so the line may or
+        // may not parse as valid JSON depending on replacement characters, but
+        // either way chunk_cost must return normally.
+        let _ = cost;
+    }
 }
