@@ -35,7 +35,7 @@ pub trait ProviderAdapter: Send {
     fn non_streaming_cost(&self, body: &Bytes) -> NonStreamingCost;
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum Provider {
     OpenAi,
     Anthropic,
