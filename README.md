@@ -84,6 +84,37 @@ window_seconds = 3600
 
 A request from a tenant not listed here is rejected with `401`.
 
+### Policy enforcement
+
+Optionally, you can restrict which models or tools a tenant is allowed to
+use. Add a `[tenants.<id>.policy]` block to define allowed models and tools:
+
+```toml
+[tenants.acct_123]
+max_tokens = 50000
+window_seconds = 60
+
+[tenants.acct_123.policy]
+blocked_models = ["gpt-3.5-turbo"]
+blocked_tools = ["send_email", "execute_shell"]
+```
+
+- **blocked_models**: If a request's `model` field matches an entry in this
+  list, the request is rejected with HTTP `403` **before any upstream call
+  is made** — no tokens are spent. The client receives the specific model
+  name that was blocked.
+
+- **blocked_tools**: If a tool call in the upstream response invokes a
+  blocked tool, Weir trips the request mid-stream (for streaming responses,
+  a terminal error event is sent; for non-streaming, a `403` is returned) —
+  the same way an over-budget response is handled. The client receives the
+  specific tool name that was blocked, but never sees the tool arguments or
+  response content.
+
+Omitting the `policy` block entirely means no tool or model restrictions,
+only the token budget applies. The config file hot-reloads on change, just
+like budgets do.
+
 Environment variables:
 
 | Variable | Default | Purpose |
@@ -91,6 +122,7 @@ Environment variables:
 | `WEIR_CONFIG` | `weir.toml` | Path to the config file |
 | `WEIR_OPENAI_BASE` | `https://api.openai.com` | Upstream OpenAI base URL |
 | `WEIR_ANTHROPIC_BASE` | `https://api.anthropic.com` | Upstream Anthropic base URL |
+| `WEIR_EVENT_LOG_CAPACITY` | `10000` | Maximum number of recent events to hold in the `/events` ring buffer |
 
 ## Using it
 
@@ -162,6 +194,24 @@ or a project-level `.claude/settings.json`):
 With this in place, every request Claude Code makes is routed through
 Weir and counted against the `acct_123` budget in `weir.toml` — including
 the tool-calling loops that are exactly what Weir is designed to catch.
+
+### Telemetry
+
+`GET /events?since=<event_id>&limit=<n>` returns a cursor-paginated stream
+of recent per-request usage events in JSON format. Each event contains
+metadata only — tenant ID, provider, model, tool names (if any), token
+count, and whether the request was blocked and why. Event payloads and
+tool arguments are never logged.
+
+```bash
+curl http://localhost:8080/events?since=0&limit=100
+```
+
+The event log is an in-memory ring buffer with a fixed capacity (controlled
+by `WEIR_EVENT_LOG_CAPACITY`, default 10,000 events). If a consumer falls
+behind, older events are evicted. This surface is designed for telemetry
+collection — e.g., metrics export or SaaS agent auditing — not for durable
+request tracking.
 
 ## Development
 

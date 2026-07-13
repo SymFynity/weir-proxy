@@ -2,6 +2,10 @@
 max_tokens = 50000
 window_seconds = 60
 
+[tenants.acct_123.policy]
+blocked_models = ["gpt-3.5-turbo"]
+blocked_tools = ["send_email", "execute_shell"]
+
 [tenants.acct_456]
 max_tokens = 200000
 window_seconds = 3600
