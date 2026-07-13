@@ -11,19 +11,28 @@ pub use anthropic::AnthropicAdapter;
 pub struct ChunkCost {
     pub estimated_tokens: u64,
     pub authoritative_total: Option<u64>,
+    /// Names of any tools invoked in this chunk/event — never call
+    /// arguments, only the tool's name, per the project's privacy line.
+    pub tool_calls: Vec<String>,
+}
+
+/// The result of parsing a complete (non-streaming) JSON response body.
+pub struct NonStreamingCost {
+    pub total_tokens: Option<u64>,
+    /// Names of any tools invoked anywhere in the response — never call
+    /// arguments.
+    pub tool_calls: Vec<String>,
 }
 
 pub trait ProviderAdapter: Send {
     fn chunk_cost(&mut self, raw: &Bytes) -> ChunkCost;
 
-    /// Parses a complete (non-streaming) JSON response body and returns the
-    /// authoritative total token count, if the body's shape is recognized.
-    /// Non-streaming responses always carry their own authoritative usage
-    /// (no interim estimation needed, unlike the streaming `chunk_cost`
-    /// path). Returns `None` for a body that doesn't parse as an expected
-    /// response shape (e.g. a provider error response) — no usage means
-    /// nothing to charge.
-    fn non_streaming_cost(&self, body: &Bytes) -> Option<u64>;
+    /// Parses a complete (non-streaming) JSON response body and returns
+    /// its authoritative total token count (if present) and any tool
+    /// calls found. Non-streaming responses always carry their own
+    /// authoritative usage (no interim estimation needed, unlike the
+    /// streaming `chunk_cost` path).
+    fn non_streaming_cost(&self, body: &Bytes) -> NonStreamingCost;
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
