@@ -149,11 +149,13 @@ async fn proxy(
                 block_reason: Some(format!("blocked_model:{model_name}")),
                 timestamp_ms: now_ms(),
             });
-            // The client-facing error deliberately omits which model was
-            // blocked — only the internal `UsageEvent.block_reason` above
-            // (server-side telemetry) carries the specific identifier.
+            // The client-facing error names the specific blocked model: the
+            // caller already knows its own model names, and revealing the
+            // NAME (never the upstream response content or tool arguments) is
+            // better DX for a governance product. This matches the specific
+            // format used by the internal `UsageEvent.block_reason` above.
             return with_connection_close(
-                WeirError::PolicyViolation { tenant, reason: "blocked_model".to_string() }
+                WeirError::PolicyViolation { tenant, reason: format!("blocked_model:{model_name}") }
                     .into_response(),
             );
         }
@@ -250,13 +252,14 @@ async fn proxy(
                 block_reason: Some(format!("blocked_tool:{tool}")),
                 timestamp_ms: now_ms(),
             });
-            // The client-facing error deliberately omits which tool was
-            // blocked — the response body must not leak anything about the
-            // rejected response's content, including the tool's name.
-            // Only the internal `UsageEvent.block_reason` above (server-side
-            // telemetry) carries the specific identifier.
+            // The client-facing error names the specific blocked tool,
+            // consistent with the streaming path's `policy_violation` terminal
+            // event. Only the tool NAME is revealed — the upstream response
+            // content and tool call ARGUMENTS must never reach the client.
+            // This matches the specific format used by the internal
+            // `UsageEvent.block_reason` above.
             return with_connection_close(
-                WeirError::PolicyViolation { tenant, reason: "blocked_tool".to_string() }
+                WeirError::PolicyViolation { tenant, reason: format!("blocked_tool:{tool}") }
                     .into_response(),
             );
         }
@@ -678,7 +681,7 @@ mod tests {
         Mock::given(method("POST"))
             .and(path("/v1/chat/completions"))
             .respond_with(ResponseTemplate::new(200).set_body_raw(
-                "{\"choices\":[{\"message\":{\"content\":null,\"tool_calls\":[{\"id\":\"call_1\",\"type\":\"function\",\"function\":{\"name\":\"send_email\",\"arguments\":\"{}\"}}]}}],\"usage\":{\"prompt_tokens\":5,\"completion_tokens\":2,\"total_tokens\":7}}",
+                "{\"choices\":[{\"message\":{\"content\":\"CONFIDENTIAL_UPSTREAM_TEXT\",\"tool_calls\":[{\"id\":\"call_1\",\"type\":\"function\",\"function\":{\"name\":\"send_email\",\"arguments\":\"{\\\"secret\\\":\\\"ARGUMENT_SECRET\\\"}\"}}]}}],\"usage\":{\"prompt_tokens\":5,\"completion_tokens\":2,\"total_tokens\":7}}",
                 "application/json",
             ))
             .mount(&mock)
@@ -718,9 +721,18 @@ mod tests {
 
         assert_eq!(response.status(), StatusCode::FORBIDDEN);
         let body = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let body = String::from_utf8_lossy(&body);
         assert!(
-            !String::from_utf8_lossy(&body).contains("send_email"),
-            "the blocked tool's presence must not leak the underlying response content to the client"
+            body.contains("send_email"),
+            "the blocked tool name is intentionally revealed to the client in the error reason"
+        );
+        assert!(
+            !body.contains("CONFIDENTIAL_UPSTREAM_TEXT"),
+            "the upstream response content must never be forwarded to the client on a policy reject"
+        );
+        assert!(
+            !body.contains("ARGUMENT_SECRET"),
+            "tool call arguments must never be forwarded to the client"
         );
     }
 }
