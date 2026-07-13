@@ -87,7 +87,9 @@ A request from a tenant not listed here is rejected with `401`.
 ### Policy enforcement
 
 Optionally, you can restrict which models or tools a tenant is allowed to
-use. Add a `[tenants.<id>.policy]` block to define allowed models and tools:
+use. Add a `[tenants.<id>.policy]` block to define which models and tools
+are **blocked** for a tenant. Anything not listed is allowed; omitting the
+block entirely means no restrictions beyond the token budget:
 
 ```toml
 [tenants.acct_123]
@@ -197,19 +199,21 @@ the tool-calling loops that are exactly what Weir is designed to catch.
 
 ### Telemetry
 
-`GET /events?since=<event_id>&limit=<n>` returns a cursor-paginated stream
+`GET /events?since=<event_id>&limit=<n>` returns a cursor-paginated list
 of recent per-request usage events in JSON format. Each event contains
 metadata only — tenant ID, provider, model, tool names (if any), token
-count, and whether the request was blocked and why. Event payloads and
-tool arguments are never logged.
+count, a millisecond timestamp, and whether the request was blocked and
+why. Event payloads and tool arguments are never logged.
 
 ```bash
 curl http://localhost:8080/events?since=0&limit=100
 ```
 
-The event log is an in-memory ring buffer with a fixed capacity (controlled
-by `WEIR_EVENT_LOG_CAPACITY`, default 10,000 events). If a consumer falls
-behind, older events are evicted. This surface is designed for telemetry
+The event log is an in-memory ring buffer bounded by
+`WEIR_EVENT_LOG_CAPACITY` (default 10,000 events). Once full, the oldest
+events are evicted on each new event, regardless of whether any consumer
+has read them — so a consumer that polls infrequently may miss events that
+were evicted before it read them. This surface is designed for telemetry
 collection — e.g., metrics export or SaaS agent auditing — not for durable
 request tracking.
 
