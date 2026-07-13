@@ -11,9 +11,11 @@ const BUDGET_EXCEEDED_EVENT: &[u8] =
     b"event: error\ndata: {\"error\":\"budget_exceeded\"}\n\n";
 
 fn policy_violation_event(tool: &str) -> Bytes {
-    Bytes::from(format!(
-        "event: error\ndata: {{\"error\":\"policy_violation\",\"tool\":\"{tool}\"}}\n\n"
-    ))
+    // Build the JSON via serde so the tool name (which originates from the
+    // upstream response) is properly escaped — a name containing a quote or
+    // backslash must not produce malformed SSE JSON.
+    let payload = serde_json::json!({ "error": "policy_violation", "tool": tool });
+    Bytes::from(format!("event: error\ndata: {payload}\n\n"))
 }
 
 /// Buffers raw upstream bytes and yields only complete SSE events (each
@@ -597,6 +599,18 @@ mod tests {
         assert_eq!(events.len(), 1, "an early-dropped stream must still emit exactly one event");
         assert_eq!(events[0].outcome, UsageOutcome::Incomplete);
         assert_eq!(events[0].tokens, 1, "tokens already forwarded before the drop are recorded");
+    }
+
+    #[test]
+    fn policy_violation_event_escapes_special_chars_in_tool_name() {
+        let event = policy_violation_event("weird\"name");
+        let text = String::from_utf8_lossy(&event);
+        // The data line must be valid JSON after the "data: " prefix.
+        let data_line = text.lines().find(|l| l.starts_with("data: ")).unwrap();
+        let json = data_line.strip_prefix("data: ").unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(json).unwrap();
+        assert_eq!(parsed["tool"], "weird\"name");
+        assert_eq!(parsed["error"], "policy_violation");
     }
 
     mod sse_frame_buffer_tests {

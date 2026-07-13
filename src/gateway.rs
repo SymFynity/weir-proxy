@@ -146,7 +146,22 @@ async fn proxy(
         Err(e) => return with_connection_close(e.into_response()),
     };
 
-    let model = extract_model_name(&body);
+    // The model field drives both policy model-blocking and telemetry, so
+    // it must be extracted from the full body (never truncated — a client
+    // could otherwise pad the body to evade a blocked-model check). A full
+    // serde parse of a very large body (base64 vision payloads up to the
+    // 100MiB cap) can take hundreds of ms, so offload large-body parses to
+    // a blocking thread to avoid stalling an async worker; parse small
+    // bodies inline to avoid spawn overhead.
+    const INLINE_MODEL_PARSE_LIMIT: usize = 256 * 1024;
+    let model = if body.len() <= INLINE_MODEL_PARSE_LIMIT {
+        extract_model_name(&body)
+    } else {
+        let body_for_probe = body.clone(); // Bytes clone is a cheap refcount bump
+        tokio::task::spawn_blocking(move || extract_model_name(&body_for_probe))
+            .await
+            .unwrap_or(None)
+    };
     if let Some(model_name) = &model {
         if policy.blocked_models.contains(model_name) {
             state.events.push(UsageEvent {
