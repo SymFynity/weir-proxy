@@ -11,7 +11,7 @@ use crate::budget::BudgetRegistry;
 use crate::enforcer;
 use crate::error::WeirError;
 use crate::provider::{Provider, Tokenizer};
-use crate::telemetry::{EventLog, UsageEvent};
+use crate::telemetry::{EventLog, UsageEvent, UsageOutcome};
 
 const TENANT_HEADER: &str = "x-weir-tenant";
 
@@ -125,7 +125,18 @@ async fn proxy(
     match state.budget.is_within_budget(&tenant, now) {
         Ok(true) => {}
         Ok(false) => {
-            return with_connection_close(WeirError::BudgetExceeded(tenant).into_response())
+            state.events.push(UsageEvent {
+                id: 0,
+                tenant: tenant.clone(),
+                provider,
+                model: None,
+                tools_called: Vec::new(),
+                tokens: 0,
+                outcome: UsageOutcome::BudgetBlocked,
+                rule: None,
+                timestamp_ms: now_ms(),
+            });
+            return with_connection_close(WeirError::BudgetExceeded(tenant).into_response());
         }
         Err(e) => return with_connection_close(e.into_response()),
     }
@@ -145,15 +156,15 @@ async fn proxy(
                 model: model.clone(),
                 tools_called: Vec::new(),
                 tokens: 0,
-                blocked: true,
-                block_reason: Some(format!("blocked_model:{model_name}")),
+                outcome: UsageOutcome::PolicyBlocked,
+                rule: Some(format!("blocked_model:{model_name}")),
                 timestamp_ms: now_ms(),
             });
             // The client-facing error names the specific blocked model: the
             // caller already knows its own model names, and revealing the
             // NAME (never the upstream response content or tool arguments) is
             // better DX for a governance product. This matches the specific
-            // format used by the internal `UsageEvent.block_reason` above.
+            // format used by the internal `UsageEvent.rule` above.
             return with_connection_close(
                 WeirError::PolicyViolation { tenant, reason: format!("blocked_model:{model_name}") }
                     .into_response(),
@@ -176,7 +187,20 @@ async fn proxy(
 
     let upstream_res = match upstream_req.send().await {
         Ok(res) => res,
-        Err(e) => return with_connection_close(WeirError::Upstream(e).into_response()),
+        Err(e) => {
+            state.events.push(UsageEvent {
+                id: 0,
+                tenant: tenant.clone(),
+                provider,
+                model: model.clone(),
+                tools_called: Vec::new(),
+                tokens: 0,
+                outcome: UsageOutcome::UpstreamError,
+                rule: None,
+                timestamp_ms: now_ms(),
+            });
+            return with_connection_close(WeirError::Upstream(e).into_response());
+        }
     };
 
     let status = upstream_res.status();
@@ -233,7 +257,20 @@ async fn proxy(
     // rather than delivered to the client.
     let body_bytes = match upstream_res.bytes().await {
         Ok(b) => b,
-        Err(e) => return with_connection_close(WeirError::Upstream(e).into_response()),
+        Err(e) => {
+            state.events.push(UsageEvent {
+                id: 0,
+                tenant: tenant.clone(),
+                provider,
+                model: model.clone(),
+                tools_called: Vec::new(),
+                tokens: 0,
+                outcome: UsageOutcome::UpstreamError,
+                rule: None,
+                timestamp_ms: now_ms(),
+            });
+            return with_connection_close(WeirError::Upstream(e).into_response());
+        }
     };
 
     let adapter = state.tokenizer.new_adapter(provider);
@@ -248,8 +285,8 @@ async fn proxy(
                 model: model.clone(),
                 tools_called: cost.tool_calls.clone(),
                 tokens: cost.total_tokens.unwrap_or(0),
-                blocked: true,
-                block_reason: Some(format!("blocked_tool:{tool}")),
+                outcome: UsageOutcome::PolicyBlocked,
+                rule: Some(format!("blocked_tool:{tool}")),
                 timestamp_ms: now_ms(),
             });
             // The client-facing error names the specific blocked tool,
@@ -257,7 +294,7 @@ async fn proxy(
             // event. Only the tool NAME is revealed — the upstream response
             // content and tool call ARGUMENTS must never reach the client.
             // This matches the specific format used by the internal
-            // `UsageEvent.block_reason` above.
+            // `UsageEvent.rule` above.
             return with_connection_close(
                 WeirError::PolicyViolation { tenant, reason: format!("blocked_tool:{tool}") }
                     .into_response(),
@@ -276,8 +313,8 @@ async fn proxy(
                     model: model.clone(),
                     tools_called: cost.tool_calls.clone(),
                     tokens: total,
-                    blocked: true,
-                    block_reason: Some("budget_exceeded".to_string()),
+                    outcome: UsageOutcome::BudgetBlocked,
+                    rule: None,
                     timestamp_ms: now_ms(),
                 });
                 return with_connection_close(WeirError::BudgetExceeded(tenant).into_response());
@@ -293,8 +330,8 @@ async fn proxy(
         model,
         tools_called: cost.tool_calls,
         tokens: cost.total_tokens.unwrap_or(0),
-        blocked: false,
-        block_reason: None,
+        outcome: UsageOutcome::Completed,
+        rule: None,
         timestamp_ms: now_ms(),
     });
 
@@ -389,6 +426,34 @@ mod tests {
             .unwrap();
         assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
         assert_eq!(response.headers().get("connection").unwrap(), "close");
+    }
+
+    #[tokio::test]
+    async fn admission_budget_block_emits_usage_event() {
+        let state = state_with_tenant("acct_1", 0); // zero budget: always over
+        let events = state.events.clone();
+        let app = router(state);
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/openai/v1/chat/completions")
+                    .method("POST")
+                    .header(TENANT_HEADER, "acct_1")
+                    .body(AxumBody::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+
+        let recorded = events.since(0, 10);
+        assert_eq!(
+            recorded.len(),
+            1,
+            "an admission-time budget rejection must still emit a UsageEvent"
+        );
+        assert_eq!(recorded[0].outcome, UsageOutcome::BudgetBlocked);
+        assert_eq!(recorded[0].model, None);
     }
 
     #[tokio::test]
@@ -654,8 +719,8 @@ mod tests {
             model: Some("gpt-4o-mini".to_string()),
             tools_called: Vec::new(),
             tokens: 10,
-            blocked: false,
-            block_reason: None,
+            outcome: UsageOutcome::Completed,
+            rule: None,
             timestamp_ms: 0,
         });
         let app = router(state);

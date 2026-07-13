@@ -3,8 +3,31 @@ use std::sync::Mutex;
 
 use crate::provider::Provider;
 
-/// One completed request's outcome, kept for external telemetry only —
-/// never prompt/response content, never tool call arguments, only names.
+/// The terminal outcome of a request, recorded for telemetry. Distinguishes
+/// enforcement blocks (budget vs policy) from upstream/internal errors, from
+/// an incomplete (client-disconnected) request, and from normal completion —
+/// so a consumer never has to infer intent from an overloaded boolean.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum UsageOutcome {
+    /// The request completed and its response was forwarded to the client.
+    Completed,
+    /// Rejected at admission, or tripped mid-stream, for exceeding the
+    /// tenant's token budget.
+    BudgetBlocked,
+    /// Rejected or tripped by a policy rule (a blocked model or tool). The
+    /// specific rule identifier is in `UsageEvent.rule`.
+    PolicyBlocked,
+    /// The upstream provider call failed (network/protocol error).
+    UpstreamError,
+    /// The request did not reach a terminal state — e.g. the client
+    /// disconnected mid-stream before completion or a trip. Any tokens
+    /// already forwarded are still recorded in `tokens`.
+    Incomplete,
+}
+
+/// One request's outcome, kept for external telemetry only — never
+/// prompt/response content, never tool call arguments, only names.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct UsageEvent {
     pub id: u64,
@@ -13,8 +36,11 @@ pub struct UsageEvent {
     pub model: Option<String>,
     pub tools_called: Vec<String>,
     pub tokens: u64,
-    pub blocked: bool,
-    pub block_reason: Option<String>,
+    pub outcome: UsageOutcome,
+    /// For `PolicyBlocked`, the specific rule identifier, e.g.
+    /// `"blocked_tool:send_email"` or `"blocked_model:gpt-3.5-turbo"`.
+    /// `None` for every other outcome. Never contains content or arguments.
+    pub rule: Option<String>,
     pub timestamp_ms: i64,
 }
 
@@ -72,8 +98,8 @@ mod tests {
             model: Some("gpt-4o-mini".to_string()),
             tools_called: vec![],
             tokens: 10,
-            blocked: false,
-            block_reason: None,
+            outcome: UsageOutcome::Completed,
+            rule: None,
             timestamp_ms: 0,
         }
     }

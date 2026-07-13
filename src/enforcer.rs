@@ -5,7 +5,7 @@ use futures::{Stream, StreamExt};
 use crate::budget::BudgetRegistry;
 use crate::error::WeirError;
 use crate::provider::{Provider, ProviderAdapter};
-use crate::telemetry::{EventLog, UsageEvent};
+use crate::telemetry::{EventLog, UsageEvent, UsageOutcome};
 
 const BUDGET_EXCEEDED_EVENT: &[u8] =
     b"event: error\ndata: {\"error\":\"budget_exceeded\"}\n\n";
@@ -106,6 +106,53 @@ fn process_event(acc: &mut EventAccounting, event: &Bytes, now_ms: i64) -> Resul
     })
 }
 
+/// Owns the per-stream telemetry state and guarantees exactly one
+/// `UsageEvent` is emitted for the request. Terminal paths call `emit(...)`
+/// explicitly; if the stream generator is dropped before any terminal
+/// (e.g. the client disconnects mid-stream), `Drop` emits an `Incomplete`
+/// event so no request is ever invisible in telemetry.
+struct StreamTelemetry {
+    event_log: Arc<EventLog>,
+    tenant: String,
+    provider: Provider,
+    model: Option<String>,
+    now_ms: Box<dyn Fn() -> i64 + Send>,
+    tools_seen: Vec<String>,
+    recorded_so_far: u64,
+    emitted: bool,
+}
+
+impl StreamTelemetry {
+    fn emit(&mut self, outcome: UsageOutcome, rule: Option<String>) {
+        if self.emitted {
+            return;
+        }
+        self.emitted = true;
+        self.event_log.push(UsageEvent {
+            id: 0,
+            tenant: self.tenant.clone(),
+            provider: self.provider,
+            model: self.model.clone(),
+            tools_called: self.tools_seen.clone(),
+            tokens: self.recorded_so_far,
+            outcome,
+            rule,
+            timestamp_ms: (self.now_ms)(),
+        });
+    }
+}
+
+impl Drop for StreamTelemetry {
+    fn drop(&mut self) {
+        // Reached only if no terminal path emitted first — i.e. the
+        // generator was dropped early (client disconnect). Record the
+        // partial request as Incomplete rather than losing it entirely.
+        if !self.emitted {
+            self.emit(UsageOutcome::Incomplete, None);
+        }
+    }
+}
+
 /// Wraps an upstream SSE byte stream, enforcing the tenant's token budget
 /// and tool policy event by event. Raw upstream reads are first
 /// reassembled into complete SSE events (see `SseFrameBuffer`), so
@@ -129,81 +176,96 @@ pub fn enforce(
     now_ms: impl Fn() -> i64 + Send + 'static,
 ) -> impl Stream<Item = Result<Bytes, WeirError>> {
     async_stream::stream! {
-        let mut recorded_so_far: u64 = 0;
-        let mut tools_seen: Vec<String> = Vec::new();
+        let mut tel = StreamTelemetry {
+            event_log,
+            tenant,
+            provider,
+            model,
+            now_ms: Box::new(now_ms),
+            tools_seen: Vec::new(),
+            recorded_so_far: 0,
+            emitted: false,
+        };
         let mut frames = SseFrameBuffer::new();
-
-        macro_rules! emit_and_return {
-            ($blocked:expr, $reason:expr) => {{
-                event_log.push(UsageEvent {
-                    id: 0,
-                    tenant: tenant.clone(),
-                    provider,
-                    model: model.clone(),
-                    tools_called: tools_seen.clone(),
-                    tokens: recorded_so_far,
-                    blocked: $blocked,
-                    block_reason: $reason,
-                    timestamp_ms: now_ms(),
-                });
-                return;
-            }};
-        }
 
         while let Some(chunk_res) = upstream.next().await {
             let raw = match chunk_res {
                 Ok(raw) => raw,
                 Err(e) => {
                     yield Err(WeirError::Upstream(e));
-                    emit_and_return!(true, Some("upstream_error".to_string()));
+                    tel.emit(UsageOutcome::UpstreamError, None);
+                    return;
                 }
             };
 
             for event in frames.push(&raw) {
-                let mut acc = EventAccounting {
-                    adapter: adapter.as_mut(),
-                    budget: &budget,
-                    tenant: &tenant,
-                    blocked_tools: &blocked_tools,
-                    recorded_so_far: &mut recorded_so_far,
-                    tools_seen: &mut tools_seen,
+                let ts = (tel.now_ms)();
+                let outcome = {
+                    let mut acc = EventAccounting {
+                        adapter: adapter.as_mut(),
+                        budget: &budget,
+                        tenant: &tel.tenant,
+                        blocked_tools: &blocked_tools,
+                        recorded_so_far: &mut tel.recorded_so_far,
+                        tools_seen: &mut tel.tools_seen,
+                    };
+                    process_event(&mut acc, &event, ts)
                 };
-                match process_event(&mut acc, &event, now_ms()) {
+                match outcome {
                     Ok(EventOutcome::Forward(bytes)) => yield Ok(bytes),
                     Ok(EventOutcome::BudgetTrip) => {
                         yield Ok(Bytes::from_static(BUDGET_EXCEEDED_EVENT));
-                        emit_and_return!(true, Some("budget_exceeded".to_string()));
+                        tel.emit(UsageOutcome::BudgetBlocked, None);
+                        return;
                     }
                     Ok(EventOutcome::PolicyTrip(tool)) => {
                         yield Ok(policy_violation_event(&tool));
-                        emit_and_return!(true, Some(format!("blocked_tool:{tool}")));
+                        tel.emit(UsageOutcome::PolicyBlocked, Some(format!("blocked_tool:{tool}")));
+                        return;
                     }
                     Err(e) => {
                         yield Err(e);
-                        emit_and_return!(true, Some("error".to_string()));
+                        tel.emit(UsageOutcome::UpstreamError, None);
+                        return;
                     }
                 }
             }
         }
 
         if let Some(event) = frames.flush() {
-            let mut acc = EventAccounting {
-                adapter: adapter.as_mut(),
-                budget: &budget,
-                tenant: &tenant,
-                blocked_tools: &blocked_tools,
-                recorded_so_far: &mut recorded_so_far,
-                tools_seen: &mut tools_seen,
+            let ts = (tel.now_ms)();
+            let outcome = {
+                let mut acc = EventAccounting {
+                    adapter: adapter.as_mut(),
+                    budget: &budget,
+                    tenant: &tel.tenant,
+                    blocked_tools: &blocked_tools,
+                    recorded_so_far: &mut tel.recorded_so_far,
+                    tools_seen: &mut tel.tools_seen,
+                };
+                process_event(&mut acc, &event, ts)
             };
-            match process_event(&mut acc, &event, now_ms()) {
+            match outcome {
                 Ok(EventOutcome::Forward(bytes)) => yield Ok(bytes),
-                Ok(EventOutcome::BudgetTrip) => yield Ok(Bytes::from_static(BUDGET_EXCEEDED_EVENT)),
-                Ok(EventOutcome::PolicyTrip(tool)) => yield Ok(policy_violation_event(&tool)),
-                Err(e) => yield Err(e),
+                Ok(EventOutcome::BudgetTrip) => {
+                    yield Ok(Bytes::from_static(BUDGET_EXCEEDED_EVENT));
+                    tel.emit(UsageOutcome::BudgetBlocked, None);
+                    return;
+                }
+                Ok(EventOutcome::PolicyTrip(tool)) => {
+                    yield Ok(policy_violation_event(&tool));
+                    tel.emit(UsageOutcome::PolicyBlocked, Some(format!("blocked_tool:{tool}")));
+                    return;
+                }
+                Err(e) => {
+                    yield Err(e);
+                    tel.emit(UsageOutcome::UpstreamError, None);
+                    return;
+                }
             }
         }
 
-        emit_and_return!(false, None);
+        tel.emit(UsageOutcome::Completed, None);
     }
 }
 
@@ -212,7 +274,7 @@ mod tests {
     use super::*;
     use crate::config::{BudgetLimit, ParsedConfig, TenantLimits};
     use crate::provider::{ChunkCost, OpenAiAdapter, ProviderAdapter};
-    use crate::telemetry::EventLog;
+    use crate::telemetry::{EventLog, UsageOutcome};
     use arc_swap::ArcSwap;
     use std::collections::HashMap;
     use std::time::Duration;
@@ -465,8 +527,8 @@ mod tests {
 
         let events = event_log.since(0, 10);
         assert_eq!(events.len(), 1);
-        assert!(events[0].blocked);
-        assert_eq!(events[0].block_reason.as_deref(), Some("blocked_tool:send_email"));
+        assert_eq!(events[0].outcome, UsageOutcome::PolicyBlocked);
+        assert_eq!(events[0].rule.as_deref(), Some("blocked_tool:send_email"));
         assert_eq!(events[0].tools_called, vec!["send_email".to_string()]);
     }
 
@@ -496,9 +558,45 @@ mod tests {
 
         let events = event_log.since(0, 10);
         assert_eq!(events.len(), 1, "exactly one UsageEvent per completed stream, not one per chunk");
-        assert!(!events[0].blocked);
+        assert_eq!(events[0].outcome, UsageOutcome::Completed);
         assert_eq!(events[0].tokens, 20);
         assert_eq!(events[0].model.as_deref(), Some("gpt-4o-mini"));
+    }
+
+    #[tokio::test]
+    async fn dropping_stream_early_emits_incomplete_event() {
+        use futures::StreamExt;
+        // An upstream that would yield two forwardable events, but we drop the
+        // stream after pulling only the first — simulating a client disconnect.
+        let upstream = futures::stream::iter(vec![
+            Ok(Bytes::from_static(b"chunk1\n\n")),
+            Ok(Bytes::from_static(b"chunk2\n\n")),
+        ]);
+        let adapter: Box<dyn ProviderAdapter> = Box::new(FixedCostAdapter { cost_per_chunk: 1 });
+        let budget = budget_with("acct_1", 1000);
+        let event_log = Arc::new(EventLog::new(100));
+
+        {
+            let mut stream = Box::pin(enforce(
+                "acct_1".into(),
+                Provider::OpenAi,
+                Some("gpt-4o-mini".to_string()),
+                upstream,
+                adapter,
+                budget,
+                Vec::new(),
+                event_log.clone(),
+                || 0,
+            ));
+            // Pull exactly one item (forwards chunk1), then drop the stream.
+            let _first = stream.next().await;
+            // stream dropped here at end of block, before completion
+        }
+
+        let events = event_log.since(0, 10);
+        assert_eq!(events.len(), 1, "an early-dropped stream must still emit exactly one event");
+        assert_eq!(events[0].outcome, UsageOutcome::Incomplete);
+        assert_eq!(events[0].tokens, 1, "tokens already forwarded before the drop are recorded");
     }
 
     mod sse_frame_buffer_tests {

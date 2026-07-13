@@ -229,5 +229,5 @@ data: {\"choices\":[{\"delta\":{}}],\"usage\":{\"prompt_tokens\":1,\"completion_
     let events: Vec<weir::telemetry::UsageEvent> = serde_json::from_slice(&body).unwrap();
     assert_eq!(events.len(), 1);
     assert_eq!(events[0].tenant, "acct_1");
-    assert!(!events[0].blocked);
+    assert_eq!(events[0].outcome, weir::telemetry::UsageOutcome::Completed);
 }
