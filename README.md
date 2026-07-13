@@ -199,10 +199,14 @@ the tool-calling loops that are exactly what Weir is designed to catch.
 
 ### Telemetry
 
-`GET /events?since=<event_id>&limit=<n>` returns a cursor-paginated list
-of recent per-request usage events in JSON format. Each event contains
-metadata only — tenant ID, provider, model, tool names (if any), token
-count, a millisecond timestamp, and an `outcome` (`completed`,
+`GET /events?since=<event_id>&limit=<n>` returns a JSON object
+`{ "generation": "<id>", "events": [ ... ] }`. `generation` is a
+per-process identifier that changes whenever Weir restarts — a consumer
+that persists a cursor should treat the cursor as valid only within a
+single generation and reset it (to 0) when the generation changes, since
+event ids restart at 1 on each Weir process. Each event in `events`
+contains metadata only — tenant ID, provider, model, tool names (if any),
+token count, a millisecond timestamp, and an `outcome` (`completed`,
 `budget_blocked`, `policy_blocked`, `upstream_error`, or `incomplete`)
 plus, for a policy block, the specific `rule` that fired (e.g.
 `blocked_tool:send_email`). Exactly one event is recorded per request on

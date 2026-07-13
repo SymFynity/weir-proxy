@@ -11,7 +11,7 @@ use crate::budget::BudgetRegistry;
 use crate::enforcer;
 use crate::error::WeirError;
 use crate::provider::{Provider, Tokenizer};
-use crate::telemetry::{EventLog, UsageEvent, UsageOutcome};
+use crate::telemetry::{EventLog, EventsResponse, UsageEvent, UsageOutcome};
 
 const TENANT_HEADER: &str = "x-weir-tenant";
 
@@ -23,6 +23,9 @@ pub struct AppState {
     pub openai_base: String,
     pub anthropic_base: String,
     pub events: Arc<EventLog>,
+    /// Per-process identifier included in the `/events` response so a
+    /// consumer can detect a Weir restart (see EventsResponse).
+    pub generation: String,
 }
 
 pub fn now_ms() -> i64 {
@@ -94,10 +97,13 @@ struct EventsQuery {
 async fn events_handler(
     State(state): State<AppState>,
     Query(query): Query<EventsQuery>,
-) -> axum::Json<Vec<UsageEvent>> {
+) -> axum::Json<EventsResponse> {
     let since = query.since.unwrap_or(0);
     let limit = query.limit.unwrap_or(100).min(1000);
-    axum::Json(state.events.since(since, limit))
+    axum::Json(EventsResponse {
+        generation: state.generation.clone(),
+        events: state.events.since(since, limit),
+    })
 }
 
 fn extract_model_name(body: &Bytes) -> Option<String> {
@@ -406,6 +412,7 @@ mod tests {
             openai_base: "http://127.0.0.1:1".into(), // unreachable on purpose for this test
             anthropic_base: "http://127.0.0.1:1".into(),
             events: Arc::new(EventLog::new(1000)),
+            generation: "test-generation".to_string(),
         }
     }
 
@@ -747,7 +754,9 @@ mod tests {
 
         assert_eq!(response.status(), StatusCode::OK);
         let body = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
-        let events: Vec<UsageEvent> = serde_json::from_slice(&body).unwrap();
+        let parsed: EventsResponse = serde_json::from_slice(&body).unwrap();
+        assert_eq!(parsed.generation, "test-generation");
+        let events = parsed.events;
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].tenant, "acct_1");
     }

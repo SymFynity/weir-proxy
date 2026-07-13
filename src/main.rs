@@ -27,6 +27,11 @@ async fn main() {
     let _watcher = config::watch(config_path.clone(), shared_config.clone())
         .unwrap_or_else(|e| panic!("failed to watch config at {}: {e}", config_path.display()));
 
+    let generation = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos().to_string())
+        .unwrap_or_else(|_| "0".to_string());
+
     let state = AppState {
         budget: Arc::new(BudgetRegistry::new(shared_config)),
         tokenizer: Arc::new(Tokenizer::load()),
@@ -36,6 +41,7 @@ async fn main() {
         anthropic_base: env::var("WEIR_ANTHROPIC_BASE")
             .unwrap_or_else(|_| "https://api.anthropic.com".to_string()),
         events: Arc::new(EventLog::new(event_log_capacity)),
+        generation,
     };
 
     let app = router(state);

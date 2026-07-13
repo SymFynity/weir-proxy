@@ -42,6 +42,7 @@ fn state_pointed_at(mock_base: &str, tenant: &str, max_tokens: u64) -> AppState 
         openai_base: mock_base.to_string(),
         anthropic_base: mock_base.to_string(),
         events: Arc::new(weir::telemetry::EventLog::new(1000)),
+        generation: "test-generation".to_string(),
     }
 }
 
@@ -150,6 +151,7 @@ data: {\"choices\":[{\"delta\":{\"content\":\"should never be forwarded\"}}]}\n\
         openai_base: mock.uri(),
         anthropic_base: mock.uri(),
         events: Arc::new(weir::telemetry::EventLog::new(100)),
+        generation: "test-generation".to_string(),
     };
     let app = router(state);
 
@@ -199,6 +201,7 @@ data: {\"choices\":[{\"delta\":{}}],\"usage\":{\"prompt_tokens\":1,\"completion_
         openai_base: mock.uri(),
         anthropic_base: mock.uri(),
         events: Arc::new(weir::telemetry::EventLog::new(100)),
+        generation: "test-generation".to_string(),
     };
     let app = router(state);
 
@@ -226,7 +229,9 @@ data: {\"choices\":[{\"delta\":{}}],\"usage\":{\"prompt_tokens\":1,\"completion_
         .unwrap();
     assert_eq!(events_response.status(), StatusCode::OK);
     let body = to_bytes(events_response.into_body(), usize::MAX).await.unwrap();
-    let events: Vec<weir::telemetry::UsageEvent> = serde_json::from_slice(&body).unwrap();
+    let parsed: weir::telemetry::EventsResponse = serde_json::from_slice(&body).unwrap();
+    assert_eq!(parsed.generation, "test-generation");
+    let events = parsed.events;
     assert_eq!(events.len(), 1);
     assert_eq!(events[0].tenant, "acct_1");
     assert_eq!(events[0].outcome, weir::telemetry::UsageOutcome::Completed);

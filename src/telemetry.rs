@@ -44,6 +44,16 @@ pub struct UsageEvent {
     pub timestamp_ms: i64,
 }
 
+/// The `/events` HTTP response envelope. `generation` is a per-process
+/// identifier that changes whenever Weir restarts, so a polling consumer
+/// can detect a restart (its persisted cursor is only meaningful within a
+/// single generation, since `UsageEvent.id` resets to 1 each process).
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct EventsResponse {
+    pub generation: String,
+    pub events: Vec<UsageEvent>,
+}
+
 /// A bounded, mutex-guarded ring buffer of recent `UsageEvent`s. This is
 /// NOT a hot-path structure in the sense `SlidingWindowCounter` is — it
 /// receives one push per completed request, not per chunk, so a plain
