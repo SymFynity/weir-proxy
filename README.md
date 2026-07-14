@@ -12,9 +12,11 @@ bill before anyone notices. Traditional billing dashboards report hourly
 or daily, long after the damage is done. Weir enforces in real time, on
 every request and every streamed chunk.
 
-Weir is a standalone open-source project — the proxy itself, nothing more.
-It has no dependency on, and makes no reference to, any hosted or
-commercial offering.
+Weir is the open-source core of [SymFynity](https://symfynity.com), an AI
+governance platform. The proxy is standalone and stays that way: it has no
+dependency on SymFynity, no account check, no phone-home, and no degraded
+mode. Everything it exposes is generically useful on its own — self-host it,
+ignore the rest, and it still does its job in full.
 
 ## How it works
 
