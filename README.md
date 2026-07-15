@@ -12,7 +12,7 @@ bill before anyone notices. Traditional billing dashboards report hourly
 or daily, long after the damage is done. Weir enforces in real time, on
 every request and every streamed chunk.
 
-Weir is the open-source core of [SymFynity](https://symfynity.com), an AI
+Weir is the source-available core of [SymFynity](https://symfynity.com), an AI
 governance platform. The proxy is standalone and stays that way: it has no
 dependency on SymFynity, no account check, no phone-home, and no degraded
 mode. Everything it exposes is generically useful on its own — self-host it,
@@ -248,4 +248,24 @@ the full task-by-task build and the review history.
 
 ## License
 
-Apache License 2.0 — see [`LICENSE`](LICENSE).
+Business Source License 1.1 — see [`LICENSE`](LICENSE).
+
+Weir is source-available, not open source. The distinction is narrow and worth
+stating plainly:
+
+- **Running Weir in production, inside your own organisation, is free — and
+  always will be.** The Additional Use Grant in the licence covers internal
+  production use explicitly. Nothing is held back, crippled, or gated behind a
+  licence key; there is no account check, no phone-home, and no degraded mode.
+- **You can read, modify, fork, and self-host it.** If auditing what sits in
+  your traffic path is why you're here, the licence doesn't get in your way.
+- **The one prohibited use is competitive:** offering Weir to third parties as a
+  hosted or embedded service that competes with SymFynity's paid product.
+
+Four years after any given version is published, that version becomes available
+under the Apache License 2.0 automatically. So the worst case — SymFynity
+disappears, or turns hostile — is bounded: Weir is Apache-2.0 on a rolling
+four-year lag regardless of what we do.
+
+Weir 0.1.0 was published under Apache License 2.0 and remains available under
+those terms. The Business Source License applies from 0.2.0 onward.
